@@ -19,7 +19,14 @@ const API_BASE = process.env.EXPO_PUBLIC_API_BASE;
 const WS_URL = process.env.EXPO_PUBLIC_WS_URL;
 
 const INPUT_SAMPLE_RATE = 16000;
-const OUTPUT_SAMPLE_RATE = 24000;
+// Gemini Live commonly uses 24 kHz output, but the server must send the
+// actual PCM rate in each audio message. Keeping this configurable also
+// supports 16 kHz TTS backends without playing them 1.5x too fast.
+const OUTPUT_SAMPLE_RATE = Number(
+  process.env.EXPO_PUBLIC_OUTPUT_SAMPLE_RATE ?? "24000"
+);
+const AGENT_AUDIO_SETTLE_MS = 1200;
+const SUPPORTED_OUTPUT_SAMPLE_RATES = [8000, 16000, 24000, 48000];
 
 type VoiceEvent = {
   type: string;
@@ -63,6 +70,10 @@ export default function App() {
   const callActiveRef = useRef(false);
   const mutedRef = useRef(false);
   const endingRef = useRef(false);
+  const agentAudioGateRef = useRef(false);
+  const agentAudioSettleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  );
 
   const sentChunkCountRef = useRef(0);
   const receivedChunkCountRef = useRef(0);
@@ -83,6 +94,10 @@ export default function App() {
 
     if (
       mutedRef.current ||
+      // Some Android devices do not provide reliable hardware AEC on the
+      // loudspeaker route. Do not send the agent's own voice back to Gemini:
+      // it makes Gemini interrupt the response mid-word.
+      agentAudioGateRef.current ||
       !callActiveRef.current ||
       ws?.readyState !== WebSocket.OPEN
     ) {
@@ -310,6 +325,12 @@ export default function App() {
 
   const cleanupCall = useCallback(() => {
     callActiveRef.current = false;
+    agentAudioGateRef.current = false;
+
+    if (agentAudioSettleTimerRef.current) {
+      clearTimeout(agentAudioSettleTimerRef.current);
+      agentAudioSettleTimerRef.current = null;
+    }
 
     stopMicrophone();
 
@@ -322,6 +343,11 @@ export default function App() {
   useEffect(() => {
     return () => {
       callActiveRef.current = false;
+      agentAudioGateRef.current = false;
+
+      if (agentAudioSettleTimerRef.current) {
+        clearTimeout(agentAudioSettleTimerRef.current);
+      }
 
       pcmAudio?.stopInput();
       pcmAudio?.release();
@@ -416,9 +442,10 @@ export default function App() {
 
       if (!message.data) return;
 
-      if (sampleRate !== OUTPUT_SAMPLE_RATE) {
+      if (!SUPPORTED_OUTPUT_SAMPLE_RATES.includes(sampleRate)) {
         throw new Error(
-          `Unsupported backend audio sample rate: ${sampleRate}`
+          `Unsupported backend audio sample rate: ${sampleRate}. ` +
+            "The backend must send 8000, 16000, 24000, or 48000."
         );
       }
 
@@ -429,6 +456,23 @@ export default function App() {
       }
 
       pcmAudio.enqueue(message.data, sampleRate);
+
+      // Keep the microphone capture running for fast resume, but suppress
+      // uploads while output is active. This prevents speaker echo from being
+      // mistaken for a new user turn and cutting the agent off mid-sentence.
+      agentAudioGateRef.current = true;
+      if (agentAudioSettleTimerRef.current) {
+        clearTimeout(agentAudioSettleTimerRef.current);
+      }
+      agentAudioSettleTimerRef.current = setTimeout(() => {
+        agentAudioGateRef.current = false;
+        agentAudioSettleTimerRef.current = null;
+
+        if (callActiveRef.current) {
+          setIsSpeaking(false);
+          setStatus(mutedRef.current ? "Microphone muted" : "Listening...");
+        }
+      }, AGENT_AUDIO_SETTLE_MS);
 
       receivedChunkCountRef.current += 1;
 
@@ -462,6 +506,11 @@ export default function App() {
       console.log("⏸️ Agent interrupted; clearing PCM queue");
 
       pcmAudio?.clear();
+      agentAudioGateRef.current = false;
+      if (agentAudioSettleTimerRef.current) {
+        clearTimeout(agentAudioSettleTimerRef.current);
+        agentAudioSettleTimerRef.current = null;
+      }
 
       setIsSpeaking(false);
       setStatus("Interrupted — listening...");
@@ -495,6 +544,11 @@ export default function App() {
       endingRef.current = false;
 
       mutedRef.current = false;
+      agentAudioGateRef.current = false;
+      if (agentAudioSettleTimerRef.current) {
+        clearTimeout(agentAudioSettleTimerRef.current);
+        agentAudioSettleTimerRef.current = null;
+      }
       setIsMuted(false);
 
       setStatus("Checking SLTMobitel chatbot...");
