@@ -10,6 +10,7 @@ import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.AutomaticGainControl
 import android.media.audiofx.NoiseSuppressor
 import android.util.Base64
+import android.util.Log
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
@@ -29,6 +30,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 class PcmAudioModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
   companion object {
     const val NAME = "PcmAudio"
+    private const val TAG = "PcmAudio"
     private const val DEFAULT_SAMPLE_RATE = 24_000
     private const val BYTES_PER_PCM_FRAME = 2
 
@@ -39,6 +41,9 @@ class PcmAudioModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
   }
 
   private val queueLock = Object()
+  // Serializes play/write/flush/release. AudioTrack is not safe to release
+  // concurrently with a blocking write on older vendor audio implementations.
+  private val trackLock = Object()
   private val queue = ArrayDeque<ByteArray>()
   private var queuedBytes = 0
   private val executor = Executors.newSingleThreadExecutor()
@@ -66,7 +71,14 @@ class PcmAudioModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
       return
     }
 
-    if (pcm.isEmpty()) return
+    if (pcm.isEmpty() || pcm.size % BYTES_PER_PCM_FRAME != 0) return
+
+    // A frame larger than the entire queue would otherwise wait forever on
+    // the React Native module thread. Reject malformed/oversized packets.
+    if (pcm.size > maxBufferBytes(sampleRate)) {
+      Log.w(TAG, "Ignoring oversized PCM frame: ${pcm.size} bytes at $sampleRate Hz")
+      return
+    }
 
     configureOutputSampleRate(sampleRate)
 
@@ -98,13 +110,10 @@ class PcmAudioModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
       queuedBytes = 0
       queueLock.notifyAll()
     }
-    audioTrack?.let { track ->
-      try {
-        track.pause()
-        track.flush()
-        track.play()
-      } catch (_: IllegalStateException) {
-      }
+    withCurrentTrack("clear") { track ->
+      track.pause()
+      track.flush()
+      track.play()
     }
   }
 
@@ -116,8 +125,7 @@ class PcmAudioModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
       queuedBytes = 0
       queueLock.notifyAll()
     }
-    audioTrack?.release()
-    audioTrack = null
+    releaseTrack()
     stopInput()
   }
 
@@ -216,27 +224,40 @@ class PcmAudioModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
     if (!draining.compareAndSet(false, true)) return
     executor.execute {
       val generation = playbackGeneration
-      val track = getOrCreateTrack() ?: run {
-        draining.set(false)
-        return@execute
-      }
       try {
+        val track = getOrCreateTrack() ?: run {
+          // Avoid repeatedly scheduling a failed track creation for the same
+          // queued response. A later response may retry after the route changes.
+          synchronized(queueLock) {
+            queue.clear()
+            queuedBytes = 0
+            queueLock.notifyAll()
+          }
+          return@execute
+        }
         // Keep one AudioTrack alive for the entire response.  WebSocket
         // packets are transport frames, not separate clips to play.
         waitForInitialBuffer(generation)
         if (generation != playbackGeneration) return@execute
-        if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
+        if (!startPlayback(track, generation)) return@execute
         while (true) {
           val pcm = takeNextPcm(generation) ?: break
           if (generation != playbackGeneration) continue
           var offset = 0
           while (offset < pcm.size && generation == playbackGeneration) {
-            val written = track.write(pcm, offset, pcm.size - offset, AudioTrack.WRITE_BLOCKING)
+            val written = writePcm(track, pcm, offset, pcm.size - offset, generation)
             if (written <= 0) break
             offset += written
           }
         }
-      } catch (_: IllegalStateException) {
+      } catch (error: RuntimeException) {
+        // This runs on an executor, so an uncaught exception would otherwise
+        // terminate the Android process rather than reach React Native.
+        Log.e(TAG, "PCM playback failed", error)
+      } catch (error: LinkageError) {
+        // Keep a production build alive if a vendor runtime is missing an
+        // expected framework symbol. API-22 code below does not require API 23.
+        Log.e(TAG, "PCM playback API linkage failed", error)
       } finally {
         draining.set(false)
         synchronized(queueLock) {
@@ -294,29 +315,99 @@ class PcmAudioModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
         AudioFormat.CHANNEL_OUT_MONO,
         AudioFormat.ENCODING_PCM_16BIT
       )
-      if (minBuffer <= 0) return null
+      if (minBuffer <= 0) {
+        Log.w(TAG, "Unsupported PCM output: sampleRate=$sampleRate, minBuffer=$minBuffer")
+        return null
+      }
 
-      return AudioTrack.Builder()
-        .setAudioAttributes(
+      val bufferSize = maxOf(minBuffer * 8, startBufferBytes(sampleRate))
+      val track = try {
+        // This constructor is available from API 21. The newer builder API
+        // starts at API 23 and crashes Android 5.1/API 22 at first response.
+        AudioTrack(
           AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-            .build()
-        )
-        .setAudioFormat(
+            .build(),
           AudioFormat.Builder()
             .setSampleRate(sampleRate)
             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-            .build()
+            .build(),
+          bufferSize,
+          AudioTrack.MODE_STREAM,
+          AudioManager.AUDIO_SESSION_ID_GENERATE
         )
-        // A larger hardware buffer, together with the initial jitter buffer,
-        // absorbs short pauses from the network/JS bridge without audible
-        // under-runs. AudioTrack.Builder is available from Android API 21.
-        .setBufferSizeInBytes(maxOf(minBuffer * 8, startBufferBytes(sampleRate)))
-        .setTransferMode(AudioTrack.MODE_STREAM)
-        .build()
-        .also { audioTrack = it }
+      } catch (error: IllegalArgumentException) {
+        Log.e(TAG, "Invalid PCM output configuration: sampleRate=$sampleRate, bufferSize=$bufferSize", error)
+        return null
+      } catch (error: UnsupportedOperationException) {
+        Log.e(TAG, "PCM output is unsupported by this device", error)
+        return null
+      }
+
+      if (track.state != AudioTrack.STATE_INITIALIZED) {
+        Log.w(TAG, "AudioTrack failed to initialize: sampleRate=$sampleRate, bufferSize=$bufferSize")
+        track.release()
+        return null
+      }
+
+      synchronized(trackLock) {
+        audioTrack = track
+      }
+      return track
+    }
+  }
+
+  private fun startPlayback(track: AudioTrack, generation: Long): Boolean = synchronized(trackLock) {
+    if (audioTrack !== track || generation != playbackGeneration) return@synchronized false
+    try {
+      if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
+      true
+    } catch (error: IllegalStateException) {
+      Log.e(TAG, "Unable to start PCM playback", error)
+      false
+    }
+  }
+
+  private fun writePcm(
+    track: AudioTrack,
+    pcm: ByteArray,
+    offset: Int,
+    size: Int,
+    generation: Long
+  ): Int = synchronized(trackLock) {
+    if (audioTrack !== track || generation != playbackGeneration) return@synchronized 0
+    try {
+      // API 3. This overload blocks until the requested bytes are queued and
+      // is the API-22-compatible equivalent of the API-23 write-mode method.
+      track.write(pcm, offset, size)
+    } catch (error: IllegalStateException) {
+      Log.e(TAG, "Unable to write PCM data", error)
+      0
+    }
+  }
+
+  private fun withCurrentTrack(operation: String, block: (AudioTrack) -> Unit) {
+    synchronized(trackLock) {
+      val track = audioTrack ?: return
+      try {
+        block(track)
+      } catch (error: IllegalStateException) {
+        Log.w(TAG, "AudioTrack $operation failed", error)
+      }
+    }
+  }
+
+  private fun releaseTrack() {
+    synchronized(trackLock) {
+      val track = audioTrack ?: return
+      audioTrack = null
+      try {
+        track.release()
+      } catch (error: IllegalStateException) {
+        Log.w(TAG, "AudioTrack release failed", error)
+      }
     }
   }
 
@@ -337,15 +428,11 @@ class PcmAudioModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
         queuedBytes = 0
         queueLock.notifyAll()
       }
-      audioTrack?.let { track ->
-        try {
-          track.pause()
-          track.flush()
-        } catch (_: IllegalStateException) {
-        }
-        track.release()
+      withCurrentTrack("reconfigure") { track ->
+        track.pause()
+        track.flush()
       }
-      audioTrack = null
+      releaseTrack()
       outputSampleRate = sampleRate
     }
   }
