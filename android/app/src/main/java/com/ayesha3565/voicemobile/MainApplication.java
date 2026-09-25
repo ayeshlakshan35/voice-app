@@ -12,6 +12,7 @@ import com.facebook.react.config.ReactFeatureFlags;
 import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint;
 import com.facebook.react.defaults.DefaultReactNativeHost;
 import com.facebook.soloader.SoLoader;
+import com.ubtrobot.Robot;
 
 import expo.modules.ApplicationLifecycleDispatcher;
 import expo.modules.ReactNativeHostWrapper;
@@ -33,6 +34,7 @@ public class MainApplication extends Application implements ReactApplication {
         List<ReactPackage> packages = new PackageList(this).getPackages();
         // Packages that cannot be autolinked yet can be added manually here, for example:
         packages.add(new PcmAudioPackage());
+        packages.add(new CruzrPackage());
         return packages;
       }
 
@@ -60,6 +62,14 @@ public class MainApplication extends Application implements ReactApplication {
   @Override
   public void onCreate() {
     super.onCreate();
+    try {
+      // Required by the Cruzr SDK before Robot.globalContext() is used.
+      Robot.initialize(this);
+    } catch (RuntimeException | LinkageError error) {
+      // The voice agent must remain usable if the Cruzr system service cannot
+      // initialize on a particular robot image.
+      android.util.Log.e("Cruzr", "[Cruzr] SDK initialization failed", error);
+    }
     SoLoader.init(this, /* native exopackage */ false);
     if (!BuildConfig.REACT_NATIVE_UNSTABLE_USE_RUNTIME_SCHEDULER_ALWAYS) {
       ReactFeatureFlags.unstable_useRuntimeSchedulerAlways = false;
