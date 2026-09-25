@@ -6,6 +6,7 @@
   <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
   <uses-permission android:name="android.permission.VIBRATE"/>
   <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
+  <uses-permission android:name="com.ubtrobot.permission.ROBOT"/>
 
   <queries>
     <intent>
@@ -23,6 +24,10 @@
     android:allowBackup="true"
     android:theme="@style/AppTheme"
     android:usesCleartextTraffic="true">
+
+    <uses-library
+      android:name="com.ubtrobot.rosa"
+      android:required="true"/>
 
     <meta-data android:name="expo.modules.updates.ENABLED" android:value="false"/>
     <meta-data android:name="expo.modules.updates.EXPO_SDK_VERSION" android:value="49.0.0"/>

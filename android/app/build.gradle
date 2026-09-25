@@ -136,6 +136,10 @@ android {
 }
 
 dependencies {
+    // Cruzr provides this SDK on the robot system image. Keep it compile-only
+    // so the APK compiles against the API without bundling a second copy.
+    compileOnly files('cruzr-libs/cruzr-sdk-2.8.0.jar')
+
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
 

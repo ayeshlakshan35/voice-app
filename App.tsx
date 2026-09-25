@@ -14,6 +14,10 @@ import {
   Easing,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
+import {
+  startSpeakingGesture,
+  stopSpeakingGesture,
+} from "./native/Cruzr";
 
 const API_BASE = process.env.EXPO_PUBLIC_API_BASE;
 const WS_URL = process.env.EXPO_PUBLIC_WS_URL;
@@ -71,6 +75,7 @@ export default function App() {
   const mutedRef = useRef(false);
   const endingRef = useRef(false);
   const agentAudioGateRef = useRef(false);
+  const agentGestureActiveRef = useRef(false);
   const agentAudioSettleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null
   );
@@ -335,6 +340,10 @@ export default function App() {
     stopMicrophone();
 
     pcmAudio?.release();
+    if (agentGestureActiveRef.current) {
+      stopSpeakingGesture();
+      agentGestureActiveRef.current = false;
+    }
 
     setIsConnected(false);
     setIsSpeaking(false);
@@ -351,6 +360,10 @@ export default function App() {
 
       pcmAudio?.stopInput();
       pcmAudio?.release();
+      if (agentGestureActiveRef.current) {
+        stopSpeakingGesture();
+        agentGestureActiveRef.current = false;
+      }
 
       wsRef.current?.close();
     };
@@ -457,6 +470,14 @@ export default function App() {
 
       pcmAudio.enqueue(message.data, sampleRate);
 
+      // This is the existing first reliable response/playback signal. Start
+      // one cancellable talking motion for the whole response, never per PCM
+      // transport packet.
+      if (!agentGestureActiveRef.current) {
+        startSpeakingGesture();
+        agentGestureActiveRef.current = true;
+      }
+
       // Keep the microphone capture running for fast resume, but suppress
       // uploads while output is active. This prevents speaker echo from being
       // mistaken for a new user turn and cutting the agent off mid-sentence.
@@ -469,6 +490,10 @@ export default function App() {
         agentAudioSettleTimerRef.current = null;
 
         if (callActiveRef.current) {
+          if (agentGestureActiveRef.current) {
+            stopSpeakingGesture();
+            agentGestureActiveRef.current = false;
+          }
           setIsSpeaking(false);
           setStatus(mutedRef.current ? "Microphone muted" : "Listening...");
         }
@@ -506,6 +531,10 @@ export default function App() {
       console.log("⏸️ Agent interrupted; clearing PCM queue");
 
       pcmAudio?.clear();
+      if (agentGestureActiveRef.current) {
+        stopSpeakingGesture();
+        agentGestureActiveRef.current = false;
+      }
       agentAudioGateRef.current = false;
       if (agentAudioSettleTimerRef.current) {
         clearTimeout(agentAudioSettleTimerRef.current);
